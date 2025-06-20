@@ -1,0 +1,240 @@
+import json
+import threading
+import time
+from collections import deque
+import numpy as np
+import csv
+import os
+# Replaced 'datetime' with more specific imports to fix the DeprecationWarning
+from datetime import datetime, timezone
+
+# ==============================================================================
+# 1. THE CAMPAIGN CONTROL PANEL
+# ==============================================================================
+EXPERIMENT_CAMPAIGN = [
+    {
+        'name': 'HEDGE_TEST_1',
+        'type': 'HEDGE',
+        'target_trades': 1000,
+        'params': {'stake_ot': 1.00, 'stake_nt': 3.50, 'barrier_ot': "+21.00", 'barrier_nt': "+35.00"}
+    },
+    {
+        'name': 'STRADDLE_TEST_1',
+        'type': 'STRADDLE',
+        'target_trades': 1000,
+        'params': {'stake': 1.00, 'barrier': "+30.00"}
+    },
+    {
+        'name': 'CHANNEL_TEST_1',
+        'type': 'CHANNEL',
+        'target_trades': 1000,
+        'params': {'stake': 1.00, 'barrier': "+10.00"}
+    }
+]
+
+# ==============================================================================
+# 2. VOLATILITY & ANALYSIS CONFIGURATION
+# ==============================================================================
+VOLATILITY_THRESHOLDS = {
+    'VERY_LOW': 10.0, 'LOW': 20.0, 'MEDIUM': 30.0,
+    'HIGH': 40.0, 'VERY_HIGH': float('inf')
+}
+TICK_HISTORY_SIZE = 25 
+
+# --- Library Import ---
+try:
+    from websocket import WebSocketApp
+except ImportError:
+    print("❌ Critical Error: The 'websocket-client' library is not installed correctly."); exit(1)
+
+# ==============================================================================
+# 3. DEDICATED CSV LOGGER
+# ==============================================================================
+class CSVLogger:
+    def __init__(self, filename='deriv_trade_log.csv'):
+        self.filename = filename
+        self.fieldnames = [
+            'timestamp_utc', 'experiment_name', 'trade_pair_id', 'volatility_score', 'volatility_group',
+            'contract_type', 'stake', 'barrier', 'potential_profit', 'actual_profit', 'result'
+        ]
+        self._initialize_file()
+
+    def _initialize_file(self):
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+            print(f"📄 Created log file: {self.filename}")
+
+    def log_trade(self, trade_data):
+        with open(self.filename, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(trade_data)
+
+# --- Bot Class Definition ---
+class DerivDataCollectorBot:
+    def __init__(self, api_key, experiment_config, logger):
+        self.api_key = api_key
+        self.experiment = experiment_config
+        self.logger = logger
+        self.ws = None; self.request_id = 1; self.is_running = True
+        self.is_connected = False; self.is_authorized = False
+        self.trade_in_progress = False; self.active_contracts = {}
+        self.current_proposals = {}; self.trade_pair_id_counter = 0
+        self.tick_history = deque(maxlen=TICK_HISTORY_SIZE)
+        self.last_volatility_score = 0; self.last_volatility_group = "UNKNOWN"
+
+    def connect(self):
+        print("🔌 Attempting to connect...")
+        self.is_connected = False
+        self.ws = WebSocketApp(
+            "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+            on_open=self.on_open, on_message=self.on_message,
+            on_error=self.on_error, on_close=self.on_close
+        )
+        wst = threading.Thread(target=self.ws.run_forever, daemon=True)
+        wst.start()
+        
+    def send(self, data):
+        if self.ws and self.is_connected:
+            data['req_id'] = self.request_id; self.request_id += 1
+            self.ws.send(json.dumps(data))
+
+    def on_open(self, ws):
+        print("🔗 Connected to Deriv WebSocket.")
+        self.is_connected = True
+        self.authorize()
+
+    def on_error(self, ws, error):
+        print(f"❌ WebSocket error: {error}"); self.is_connected = False
+
+    def on_close(self, ws, close_status_code=None, close_msg=None):
+        print("🔌 WebSocket connection closed."); self.is_connected = False
+        
+    def authorize(self):
+        print("🔐 Authorizing..."); self.send({"authorize": self.api_key})
+
+    def on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            msg_type = data.get('msg_type')
+
+            if msg_type == 'authorize': self.handle_authorization(data)
+            elif msg_type == 'tick': self.handle_tick(data)
+            elif msg_type == 'proposal': self.handle_proposal(data)
+            elif msg_type == 'buy': self.handle_buy(data)
+            elif msg_type == 'proposal_open_contract': self.handle_contract_update(data.get('proposal_open_contract'))
+            
+            if 'error' in data and data.get('error', {}).get('code') not in ['MarketIsClosed', 'InvalidBarrier', 'AlreadySubscribed']:
+                 print(f"❗️ API Error: {data['error']['message']}")
+        except Exception as e:
+            print(f"❌ Error processing message: {e}")
+
+    def handle_authorization(self, data):
+        if 'error' in data:
+            print(f"❌ Authorization failed: {data['error']['message']}"); self.is_running = False
+        else:
+            print("✅ Authorization successful!")
+            self.is_authorized = True
+            print("📈 Subscribing to tick stream for continuous analysis...")
+            self.send({'ticks': 'R_75', 'subscribe': 1})
+
+    def handle_tick(self, data):
+        if 'tick' in data: self.tick_history.append(data['tick']['quote'])
+
+    def handle_proposal(self, data):
+        if 'error' in data: return
+        proposal = data['proposal']; c_type = data['echo_req']['contract_type']
+        barrier_key = f"{c_type}_{proposal['id']}"
+        self.current_proposals[barrier_key] = {
+            'payout': float(proposal['payout']), 'stake': float(data['echo_req']['amount']),
+            'barrier': data['echo_req']['barrier']
+        }
+        self.send({"buy": proposal['id'], "price": proposal['ask_price'], "passthrough": {"barrier_key": barrier_key}})
+
+    def handle_buy(self, data):
+        if 'error' in data: return
+        contract_id = data['buy']['contract_id']
+        barrier_key = data['echo_req']['passthrough']['barrier_key']
+        self.active_contracts[contract_id] = self.current_proposals[barrier_key]
+        self.send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1})
+        
+    def handle_contract_update(self, contract):
+        contract_id = contract.get('contract_id')
+        if not contract or not contract.get('is_sold') or not self.active_contracts.get(contract_id):
+            return
+            
+        trade_details = self.active_contracts[contract_id]
+        profit = float(contract.get('profit', 0))
+        
+        log_entry = {
+            # --- FIX: Replaced deprecated utcnow() with modern, timezone-aware equivalent ---
+            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+            'experiment_name': self.experiment['name'],
+            'trade_pair_id': f"{self.experiment['name']}_{self.trade_pair_id_counter}",
+            'volatility_score': f"{self.last_volatility_score:.2f}",
+            'volatility_group': self.last_volatility_group,
+            'contract_type': contract.get('contract_type'),
+            'stake': trade_details['stake'],
+            'barrier': trade_details['barrier'],
+            'potential_profit': trade_details['payout'] - trade_details['stake'],
+            'actual_profit': profit,
+            'result': "WIN" if profit > 0 else "LOSS"
+        }
+        self.logger.log_trade(log_entry)
+        del self.active_contracts[contract_id]
+        if not self.active_contracts: self.trade_in_progress = False
+
+    def run_logic_tick(self):
+        if not self.is_authorized or self.trade_in_progress or len(self.tick_history) < self.tick_history.maxlen:
+            return
+
+        if self.trade_pair_id_counter < self.experiment['target_trades']:
+            self.last_volatility_score = np.std(self.tick_history)
+            for group, threshold in VOLATILITY_THRESHOLDS.items():
+                if self.last_volatility_score <= threshold:
+                    self.last_volatility_group = group; break
+            
+            self.trade_in_progress = True; self.trade_pair_id_counter += 1
+            self.current_proposals.clear()
+            print(f"\r   -> Experiment '{self.experiment['name']}': {self.trade_pair_id_counter}/{self.experiment['target_trades']} trades initiated...", end="")
+            self.place_trade()
+        else:
+            self.is_running = False
+            print(f"\n✅ Experiment '{self.experiment['name']}' complete.")
+            
+    def place_trade(self):
+        exp_type = self.experiment['type']; params = self.experiment['params']
+        base = {"basis": "stake", "currency": "USD", "duration": 5, "duration_unit": "t", "symbol": "R_75"}
+        if exp_type == 'HEDGE':
+            self.send({**base, "proposal": 1, "contract_type": "ONETOUCH", "amount": params['stake_ot'], "barrier": params['barrier_ot']})
+            self.send({**base, "proposal": 1, "contract_type": "NOTOUCH", "amount": params['stake_nt'], "barrier": params['barrier_nt']})
+        elif exp_type == 'STRADDLE':
+            self.send({**base, "proposal": 1, "contract_type": "ONETOUCH", "amount": params['stake'], "barrier": params['barrier']})
+            self.send({**base, "proposal": 1, "contract_type": "ONETOUCH", "amount": params['stake'], "barrier": f"-{params['barrier'][1:]}"})
+        elif exp_type == 'CHANNEL':
+            self.send({**base, "proposal": 1, "contract_type": "NOTOUCH", "amount": params['stake'], "barrier": params['barrier']})
+            self.send({**base, "proposal": 1, "contract_type": "NOTOUCH", "amount": params['stake'], "barrier": f"-{params['barrier'][1:]}"})
+
+def main():
+    API_KEY = 'LLU4UwUGOCv5Cpq'
+    logger = CSVLogger()
+    
+    for i, experiment_config in enumerate(EXPERIMENT_CAMPAIGN):
+        print("\n" + "="*80 + f"\n🚀 Starting Experiment {i+1}/{len(EXPERIMENT_CAMPAIGN)}: '{experiment_config['name']}'\n" + "="*80)
+        bot = DerivDataCollectorBot(API_KEY, experiment_config, logger)
+        try:
+            bot.connect()
+            while bot.is_running:
+                if not bot.is_connected and bot.is_authorized:
+                    print("\nConnection lost. Reconnecting..."); time.sleep(5); bot.connect()
+                bot.run_logic_tick(); time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n🛑 Campaign interrupted by user."); return
+        finally:
+            if bot.ws and bot.is_connected: bot.ws.close()
+            print("\n--------------------------------------------------------------------------------")
+    print(f"\n🎉🎉🎉 ALL EXPERIMENTS COMPLETE. Data saved to {logger.filename} 🎉🎉🎉")
+
+if __name__ == "__main__":
+    main()
