@@ -7,8 +7,8 @@ import os
 
 # --- Email Configuration ---
 # IMPORTANT: Use the App Password you generated, NOT your regular Gmail password.
-sender_email = "achiverscollege6@gmail.com"
-receiver_email = "markcalebchomba@gmail.com" # Can be the same or different
+sender_email = "markcalebchomba@gmail.com"
+receiver_email = "achiverscollege6@gmail.com" # Can be the same or different
 email_password = "leug erco myri ncxv" 
 
 # --- File to Attach ---
