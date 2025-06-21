@@ -1,0 +1,54 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import os
+
+# --- Email Configuration ---
+# IMPORTANT: Use the App Password you generated, NOT your regular Gmail password.
+sender_email = "achiverscollege6@gmail.com"
+receiver_email = "markcalebchomba@gmail.com" # Can be the same or different
+email_password = "leug erco myri ncxv" 
+
+# --- File to Attach ---
+file_to_attach = "live-market_data.csv"
+
+# --- Check if the file exists ---
+if not os.path.exists(file_to_attach):
+    print(f"Error: The file '{file_to_attach}' was not found.")
+else:
+    # --- Create the Email Message ---
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = receiver_email
+    msg['Subject'] = f"Market Data Report: {file_to_attach}"
+
+    # Email body
+    body = "Please find the attached market data report generated from the EC2 instance."
+    msg.attach(MIMEText(body, 'plain'))
+
+    # --- Attach the File ---
+    try:
+        with open(file_to_attach, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+        
+        encoders.encode_base64(part)
+        part.add_header(
+            'Content-Disposition',
+            f"attachment; filename= {file_to_attach}",
+        )
+        msg.attach(part)
+        print(f"Successfully attached the file: {file_to_attach}")
+
+        # --- Connect to Gmail and Send ---
+        # Using a 'with' statement ensures the connection is automatically closed
+        print("Connecting to Gmail's SMTP server...")
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender_email, email_password)
+            server.send_message(msg)
+            print("Email sent successfully!")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
