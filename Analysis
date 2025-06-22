@@ -5,9 +5,27 @@ import numpy as np
 import io
 
 # ==============================================================================
-# 1. EMBEDDED PAYOUT DATA
+# 1. BACKTESTING CONFIGURATION
 # ==============================================================================
-# The complete ONETOUCH and NOTOUCH data you provided is now embedded here.
+# --- File to analyze ---
+TICK_DATA_FILE = 'live_market_data.csv'
+
+# --- NEW: Downsampling for much faster analysis ---
+# A factor of 1 checks every tick. A factor of 20 checks every 20th tick (~20x faster).
+DATA_DOWNSAMPLE_FACTOR = 20
+
+# --- Parameters to generate strategy combinations ---
+DURATIONS_TO_TEST = [5, 10]
+STAKE_RATIOS_TO_TEST = [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (6, 1)]
+BARRIER_RANGE_TO_TEST = range(20, 41, 4)  # Increased step to reduce combinations
+
+# --- Reporting ---
+# Updated to show the top 30 strategies as requested
+TOP_N_RESULTS_TO_SHOW = 100
+
+# ==============================================================================
+# 2. EMBEDDED PAYOUT DATA
+# ==============================================================================
 PAYOUT_DATA_STRING = """barrier,payout,stake,contract_type
 10,1.47,100,ONETOUCH
 12,1.54,100,ONETOUCH
@@ -58,43 +76,30 @@ PAYOUT_DATA_STRING = """barrier,payout,stake,contract_type
 54,1.10,100,NOTOUCH
 56,1.09,100,NOTOUCH
 """
-
 # ==============================================================================
-# 2. BACKTESTING CONFIGURATION
-# ==============================================================================
-TICK_DATA_FILE = 'live_market_data.csv'
-DURATIONS_TO_TEST = [5, 10]
-STAKE_RATIOS_TO_TEST = [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (6, 1)]
-BARRIER_RANGE_TO_TEST = range(20, 41, 2)
-TOP_N_RESULTS_TO_SHOW = 25
-
-# ==============================================================================
-# 3. HELPER & STRATEGY GENERATION
+# 3. HELPER & GENERATION FUNCTIONS
 # ==============================================================================
 def find_closest_payout(barrier, contract_type, payout_df):
-    """Finds the closest barrier for a specific contract type and returns its payout and stake."""
-    # Filter the DataFrame for the correct contract type first
     type_df = payout_df[payout_df['contract_type'] == contract_type]
-    if type_df.empty: return 1.0, 100.0 # Default fallback
-    
+    if type_df.empty: return 1.0, 100.0
+    # Use a copy to avoid SettingWithCopyWarning
+    type_df = type_df.copy()
     type_df['diff'] = (type_df['barrier'] - abs(barrier)).abs()
     closest = type_df.loc[type_df['diff'].idxmin()]
     return closest['payout'], closest['stake']
 
 def generate_strategies():
-    """Builds the list of all strategy combinations to test."""
     strategies = []
     barrier_values = list(BARRIER_RANGE_TO_TEST)
-    
     for duration in DURATIONS_TO_TEST:
         for stake_ot, stake_nt in STAKE_RATIOS_TO_TEST:
             for p_ot, p_nt, n_ot, n_nt in itertools.product(barrier_values, repeat=4):
                 if p_nt > p_ot and n_nt > n_ot:
                     strategies.append({
                         'type': '4_WAY_HEDGE', 'duration': duration, 
-                        'stake_ot': float(stake_ot), 'stake_nt': float(stake_nt),
-                        'p_ot_b': float(p_ot), 'p_nt_b': float(p_nt),
-                        'n_ot_b': float(n_ot), 'n_nt_b': float(n_nt)
+                        'stake_ratio_ot': float(stake_ot), 'stake_ratio_nt': float(stake_nt),
+                        'b_pos_ot': f"+{p_ot}", 'b_pos_nt': f"+{p_nt}",
+                        'b_neg_ot': f"-{n_ot}", 'b_neg_nt': f"-{n_nt}"
                     })
     return strategies
 
@@ -104,25 +109,24 @@ def generate_strategies():
 def run_pnl_backtest(strategies, price_data, payout_df):
     results = []
     total_strategies = len(strategies)
-    
-    print(f"\n🔬 Starting simulation of {total_strategies} strategies against {len(price_data)} price points...")
+    print(f"\n🔬 Starting simulation of {total_strategies} strategies...")
 
     for i, strat in enumerate(strategies):
-        progress = (i + 1) / total_strategies
-        print(f"\r⏳ Backtesting Progress: [{'=' * int(20 * progress):<20}] {progress:.1%}", end="")
-
+        print(f"\r⏳ Backtesting Progress: [{'=' * int(40 * (i + 1) / total_strategies):<40}] {(i + 1) / total_strategies:.1%}", end="")
         total_net_profit = 0
+        trade_count = 0
         
-        for index in range(len(price_data) - strat['duration']):
+        for index in range(0, len(price_data) - strat['duration'], DATA_DOWNSAMPLE_FACTOR):
+            trade_count += 1
             entry_price = price_data[index]
             future_ticks = price_data[index + 1 : index + 1 + strat['duration']]
             round_net_profit = 0
             
             trades = [
-                {'type': 'ONETOUCH', 'barrier_val': strat['p_ot_b'], 'stake_ratio': strat['stake_ot']},
-                {'type': 'NOTOUCH',  'barrier_val': strat['p_nt_b'], 'stake_ratio': strat['stake_nt']},
-                {'type': 'ONETOUCH', 'barrier_val': -strat['n_ot_b'], 'stake_ratio': strat['stake_ot']},
-                {'type': 'NOTOUCH',  'barrier_val': -strat['n_nt_b'], 'stake_ratio': strat['stake_nt']},
+                {'type': 'ONETOUCH', 'barrier_val': float(strat['b_pos_ot']), 'stake_ratio': strat['stake_ratio_ot']},
+                {'type': 'NOTOUCH',  'barrier_val': float(strat['b_pos_nt']), 'stake_ratio': strat['stake_ratio_nt']},
+                {'type': 'ONETOUCH', 'barrier_val': float(strat['b_neg_ot']), 'stake_ratio': strat['stake_ratio_ot']},
+                {'type': 'NOTOUCH',  'barrier_val': float(strat['b_neg_nt']), 'stake_ratio': strat['stake_ratio_nt']},
             ]
             
             for trade in trades:
@@ -131,17 +135,15 @@ def run_pnl_backtest(strategies, price_data, payout_df):
                 absolute_barrier = entry_price + trade['barrier_val']
                 
                 is_win = False
-                if trade['type'] == 'ONETOUCH':
-                    is_win = any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else any(tick <= absolute_barrier for tick in future_ticks)
-                elif trade['type'] == 'NOTOUCH':
-                    is_win = not any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else not any(tick <= absolute_barrier for tick in future_ticks)
+                if trade['type'] == 'ONETOUCH': is_win = any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else any(tick <= absolute_barrier for tick in future_ticks)
+                elif trade['type'] == 'NOTOUCH': is_win = not any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else not any(tick <= absolute_barrier for tick in future_ticks)
 
                 if is_win: round_net_profit += (payout_rate * actual_stake) - actual_stake
                 else: round_net_profit -= actual_stake
             
             total_net_profit += round_net_profit
             
-        results.append({'strategy': strat, 'total_profit': total_net_profit, 'trade_rounds': len(price_data) - strat['duration']})
+        results.append({'strategy': strat, 'total_profit': total_net_profit, 'trade_rounds': trade_count})
 
     print("\n✅ Backtest complete!")
     return results
@@ -149,7 +151,8 @@ def run_pnl_backtest(strategies, price_data, payout_df):
 # ==============================================================================
 # 5. REPORTING
 # ==============================================================================
-def print_report(results):
+def print_csv_report(results):
+    """ --- NEW: Prints the final report in a clean CSV format to the console --- """
     if not results: print("No results to report."); return
 
     for res in results:
@@ -157,24 +160,41 @@ def print_report(results):
         
     sorted_results = sorted(results, key=lambda x: x['total_profit'], reverse=True)
     
-    print("\n" + "="*80)
-    print("PROFIT & LOSS BACKTESTING REPORT".center(80))
+    print("\n\n" + "="*80)
+    print("BACKTESTING REPORT - TOP 30 STRATEGIES (CSV FORMAT)".center(80))
     print("="*80)
-    print(f"Showing top {TOP_N_RESULTS_TO_SHOW} performing strategies sorted by Total Net Profit.\n")
+    print("You can copy the text below and paste it directly into a text file or spreadsheet.\n")
 
+    # Print CSV Header
+    header = "duration,stake_ratio_ot,stake_ratio_nt,b_pos_ot,b_pos_nt,b_neg_ot,b_neg_nt,total_profit,avg_profit_per_round"
+    print(header)
+    
+    # Print each result as a CSV row
     for res in sorted_results[:TOP_N_RESULTS_TO_SHOW]:
         s = res['strategy']
-        print(f"Strategy -> Duration: {s['duration']}t | Stake Ratio (OT:NT): {int(s['stake_ot'])}:{int(s['stake_nt'])}")
-        print(f"  Barriers -> [Pos OT/NT: +{s['p_ot_b']}/+{s['p_nt_b']}] [Neg OT/NT: -{s['n_ot_b']}/-{s['n_nt_b']}]")
-        print(f"  Result   -> Total Profit: ${res['total_profit']:>9.2f} | Avg Profit/Round: ${res['avg_profit_per_round']:>+7.4f}")
-        print("-" * 80)
+        row = [
+            s['duration'],
+            s['stake_ratio_ot'],
+            s['stake_ratio_nt'],
+            s['b_pos_ot'],
+            s['b_pos_nt'],
+            s['b_neg_ot'],
+            s['b_neg_nt'],
+            f"{res['total_profit']:.2f}",
+            f"{res['avg_profit_per_round']:.4f}"
+        ]
+        print(','.join(map(str, row)))
+    print("\n" + "="*80)
+
 
 # ==============================================================================
 # 6. MAIN EXECUTION
 # ==============================================================================
 def main():
+    """Main function to run the backtester."""
     try:
-        df_ticks = pd.read_csv(TICK_DATA_FILE)
+        # The script now only uses the 'price' column, ignoring timestamps.
+        df_ticks = pd.read_csv(TICK_DATA_FILE, usecols=['price'])
         price_data = df_ticks['price'].to_numpy()
         
         payout_data_io = io.StringIO(PAYOUT_DATA_STRING)
@@ -193,12 +213,13 @@ def main():
     if not strategies: print("No strategies were generated."); return
         
     results = run_pnl_backtest(strategies, price_data, df_payout)
-    print_report(results)
+    
+    print_csv_report(results)
     
     end_time = time.time()
     print(f"\nTotal analysis time: {end_time - start_time:.2f} seconds.")
 
 if __name__ == '__main__':
-    print("Starting Self-Contained P&L Backtesting Engine...")
+    print("Starting Self-Contained Offline Backtesting Engine...")
     print("Before running, make sure you have pandas and numpy: pip install pandas numpy")
     main()
