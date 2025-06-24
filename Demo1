@@ -1,1 +1,237 @@
 
+import json
+import threading
+import time
+import os
+import csv
+from datetime import datetime, timezone
+
+# --- Library Import for Websocket ---
+try:
+    from websocket import WebSocketApp
+except ImportError:
+    print("❌ Critical Error: The 'websocket-client' library is not installed correctly."); exit(1)
+
+# ==============================================================================
+# 1. BOT & STRATEGY CONFIGURATION
+# ==============================================================================
+APEX_STRATEGY = {
+    'stake_ot': 1.0, 'stake_nt': 6.0,
+    'p_ot_b': "+20.00", 'p_nt_b': "+40.00",
+    'n_ot_b': "-20.00", 'n_nt_b': "-40.00",
+    'duration': 5
+}
+TARGET_TRADE_ROUNDS = 2500
+COOLDOWN_SECONDS = 5
+INITIAL_CAPITAL = 1000.0
+
+# ==============================================================================
+# 2. EMAIL & LOGGING CONFIGURATION
+# ==============================================================================
+API_KEY = 'LLU4UwUGOCv5Cpq'
+CSV_LOG_FILE = 'apex_trade_log.csv'
+ACTIVITY_LOG_FILE = 'apex_activity_log.txt'
+EMAIL_CONFIG = {
+    "sender_email": "markcalebchomba@gmail.com",
+    "email_password": "leug erco myri ncxv",
+    "receiver_email": "achiverscollege6@gmail.com"
+}
+
+# ==============================================================================
+# 3. HELPER CLASSES: LOGGERS & EMAIL SENDER
+# ==============================================================================
+class TextLogger:
+    """Logs plain text status messages for monitoring."""
+    def __init__(self, filename):
+        self.filename = filename; self.lock = threading.Lock()
+        print(f"📄 Activity log will be saved to '{self.filename}'")
+
+    def log(self, message):
+        with self.lock:
+            with open(self.filename, 'a') as f:
+                f.write(f"{datetime.now(timezone.utc).isoformat()} - {message}\n")
+
+class CSVLogger:
+    """Logs structured trade data for analysis."""
+    def __init__(self, filename):
+        self.filename = filename
+        self.fieldnames = ['timestamp_utc', 'trade_round_id', 'contract_type', 'barrier', 'stake', 'profit', 'result']
+        self.lock = threading.Lock()
+        self._initialize_file()
+
+    def _initialize_file(self):
+        with self.lock:
+            if not os.path.exists(self.filename):
+                with open(self.filename, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames); writer.writeheader()
+                print(f"📄 Trade data CSV will be saved to '{self.filename}'")
+
+    def log(self, log_entry):
+        with self.lock:
+            with open(self.filename, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames); writer.writerow(log_entry)
+
+class EmailSender:
+    # ... (EmailSender class is unchanged) ...
+    def __init__(self, config):
+        self.sender = config["sender_email"]; self.password = config["email_password"]; self.receiver = config["receiver_email"]
+    def send_report(self, file_to_attach, summary_text):
+        if not os.path.exists(file_to_attach): print(f"❌ Email Error: The log file '{file_to_attach}' was not found."); return
+        print(f"📧 Preparing to send report to {self.receiver}...")
+        msg = MIMEMultipart(); msg['From'] = self.sender; msg['To'] = self.receiver
+        msg['Subject'] = f"Deriv Bot Session Report: {datetime.now(timezone.utc).date()}"
+        msg.attach(MIMEText(summary_text, 'plain'))
+        try:
+            with open(file_to_attach, "rb") as attachment: part = MIMEBase('application', 'octet-stream'); part.set_payload(attachment.read())
+            encoders.encode_base64(part); part.add_header('Content-Disposition', f"attachment; filename= {file_to_attach}"); msg.attach(part)
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server: server.login(self.sender, self.password); server.send_message(msg)
+            print("✅ Email with summary and CSV attachment sent successfully!")
+        except Exception as e: print(f"❌ An error occurred while sending the email: {e}")
+
+# ==============================================================================
+# 4. THE APEX TRADING BOT CLASS
+# ==============================================================================
+class ApexTraderBot:
+    def __init__(self, api_key, strategy, csv_logger, activity_logger):
+        self.api_key=api_key; self.strategy=strategy
+        self.csv_logger = csv_logger; self.activity_logger = activity_logger # Two separate loggers
+        self.ws=None; self.is_running=True; self.is_connected=False; self.is_authorized=False
+        self.state="INITIALIZING"; self.active_contracts={}; self.proposal_details={}
+        self.current_round_results=[]; self.reconnect_lock=threading.Lock(); self.trade_round_counter=0
+        self.initial_capital=INITIAL_CAPITAL; self.current_balance=INITIAL_CAPITAL
+        self.peak_balance=INITIAL_CAPITAL; self.max_drawdown=0
+        self.consecutive_wins=0; self.max_consecutive_wins=0
+        self.consecutive_losses=0; self.max_consecutive_losses=0
+
+    def start(self): self.connect(); 
+    def stop(self): self.is_running = False; self.ws.close()
+
+    def run_main_loop(self):
+        while self.is_running:
+            if not self.is_connected and self.state != "RECONNECTING": self.start_reconnect()
+            time.sleep(1)
+
+    def start_reconnect(self):
+        self.state = "RECONNECTING"
+        if self.reconnect_lock.acquire(blocking=False):
+            self.is_authorized=False; self.log_and_print("Connection lost. Reconnecting in 10s...")
+            threading.Timer(10, self.attempt_reconnect).start()
+    
+    def attempt_reconnect(self):
+        if self.is_running: self.connect(); self.reconnect_lock.release()
+
+    def connect(self):
+        self.log_and_print("🔌 Attempting to connect...")
+        self.ws = WebSocketApp("wss://ws.binaryws.com/websockets/v3?app_id=1089", on_open=self.on_open, on_message=self.on_message, on_error=self.on_error, on_close=self.on_close)
+        threading.Thread(target=self.ws.run_forever, daemon=True).start()
+    
+    def log_and_print(self, message): print(message); self.activity_logger.log(message)
+    def send(self, data):
+        if self.ws and self.is_connected: data['req_id'] = int(time.time()*1000); self.ws.send(json.dumps(data))
+    
+    def on_open(self, ws): self.is_connected = True; self.state = "CONNECTED"; self.log_and_print("🔗 Connected."); self.authorize()
+    def on_error(self, ws, error): self.log_and_print(f"❌ WebSocket error: {error}")
+    def on_close(self, ws, c, m): self.log_and_print("🔌 Connection closed."); self.is_connected = False
+    def authorize(self): self.log_and_print("🔐 Authorizing..."); self.send({"authorize": self.api_key})
+
+    def on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            if 'error' in data: self.handle_error(data); return
+            msg_type = data.get('msg_type')
+            if msg_type == 'authorize': self.is_authorized=True; self.log_and_print("✅ Authorized."); self.transition_to_trading()
+            elif msg_type == 'proposal': self.handle_proposal(data)
+            elif msg_type == 'buy': self.handle_buy(data)
+            elif msg_type == 'proposal_open_contract': self.handle_contract_update(data.get('proposal_open_contract'))
+        except Exception as e: self.log_and_print(f"❌ CRITICAL: Error processing message: {e}")
+
+    def handle_error(self, data):
+        self.log_and_print(f"❗️ API Error: {data['error'].get('message', 'Unknown error')}")
+        if data.get('msg_type') == 'buy': self.active_contracts.clear(); self.transition_to_cooldown()
+
+    def handle_proposal(self, data):
+        proposal_id = data['proposal']['id']; self.proposal_details[proposal_id] = {'barrier': data['echo_req']['barrier']}; self.send({"buy": proposal_id, "price": data['proposal']['ask_price']})
+    def handle_buy(self, data):
+        contract_id = data['buy']['contract_id']; proposal_id = data['echo_req']['buy']
+        if proposal_id in self.proposal_details: self.active_contracts[contract_id] = self.proposal_details[proposal_id]
+        self.send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1})
+        
+    def handle_contract_update(self, contract):
+        contract_id = contract.get('contract_id')
+        if not contract or not contract.get('is_sold') or not self.active_contracts.get(contract_id): return
+        trade_details = self.active_contracts[contract_id]; profit = float(contract.get('profit', 0)); c_type = contract.get('contract_type', 'UNKNOWN')
+        log_entry = {'timestamp_utc': datetime.now(timezone.utc).isoformat(), 'trade_round_id': self.trade_round_counter, 'contract_type': c_type, 'barrier': trade_details.get('barrier', 'N/A'), 'stake': float(contract.get('buy_price', 0)), 'profit': profit, 'result': "WIN" if profit > 0 else "LOSS"}
+        self.csv_logger.log(log_entry) # Log structured data to CSV
+        self.current_round_results.append({'profit': profit, 'result': "WIN" if profit > 0 else "LOSS", 'type': c_type})
+        del self.active_contracts[contract_id]
+        if not self.active_contracts: self.log_round_and_cooldown()
+
+    def _update_performance_metrics(self, round_pnl):
+        self.current_balance += round_pnl
+        if self.current_balance > self.peak_balance: self.peak_balance = self.current_balance
+        drawdown = self.peak_balance - self.current_balance
+        if drawdown > self.max_drawdown: self.max_drawdown = drawdown
+        if round_pnl > 0: self.consecutive_wins += 1; self.consecutive_losses = 0; self.max_consecutive_wins = max(self.max_consecutive_wins, self.consecutive_wins)
+        elif round_pnl < 0: self.consecutive_losses += 1; self.consecutive_wins = 0; self.max_consecutive_losses = max(self.max_consecutive_losses, self.consecutive_losses)
+
+    def log_round_and_cooldown(self):
+        net_profit = sum(res['profit'] for res in self.current_round_results)
+        self._update_performance_metrics(net_profit)
+        summary = f"Trade round #{self.trade_round_counter} complete. Net P/L: ${net_profit:+.2f}. Balance: ${self.current_balance:.2f}."
+        self.log_and_print(f"   -> {summary}")
+        self.transition_to_cooldown()
+        
+    def transition_to_trading(self):
+        if self.trade_round_counter >= TARGET_TRADE_ROUNDS: self.log_and_print(f"✅ Target reached. Stopping."); self.is_running = False; return
+        self.state = "TRADING"; self.trade_round_counter += 1; self.current_round_results.clear(); self.proposal_details.clear()
+        self.log_and_print(f"\n🚀 Initiating Trade Round #{self.trade_round_counter}/{TARGET_TRADE_ROUNDS}...")
+        base = {"basis": "stake", "currency": "USD", "duration": self.strategy['duration'], "duration_unit": "t", "symbol": "R_75"}
+        trades = [{'contract_type': 'ONETOUCH', 'barrier': self.strategy['p_ot_b'], 'amount': self.strategy['stake_ot']}, {'contract_type': 'NOTOUCH',  'barrier': self.strategy['p_nt_b'], 'amount': self.strategy['stake_nt']}, {'contract_type': 'ONETOUCH', 'barrier': self.strategy['n_ot_b'], 'amount': self.strategy['stake_ot']}, {'contract_type': 'NOTOUCH',  'barrier': self.strategy['n_nt_b'], 'amount': self.strategy['stake_nt']}]
+        for trade in trades: self.send({**base, **trade, "proposal": 1})
+
+    def transition_to_cooldown(self):
+        self.state = "WAITING"; threading.Timer(COOLDOWN_SECONDS, self.end_cooldown).start()
+    def end_cooldown(self):
+        if self.is_running and self.is_authorized: self.transition_to_trading()
+
+    def get_performance_summary(self):
+        total_profit = self.current_balance - self.initial_capital
+        profit_percent = (total_profit / self.initial_capital) * 100 if self.initial_capital > 0 else 0
+        drawdown_percent = (self.max_drawdown / self.peak_balance) * 100 if self.peak_balance > 0 else 0
+        summary = (f"Deriv Bot Trading Session Summary\n{'='*33}\n"
+                   f"Trading Rounds Executed: {self.trade_round_counter}\n\n--- P&L ---\n"
+                   f"Initial Capital: ${self.initial_capital:,.2f}\nFinal Balance:   ${self.current_balance:,.2f}\n"
+                   f"Total Net Profit:  ${total_profit:,.2f} ({profit_percent:.2f}%)\n\n--- Risk Metrics ---\n"
+                   f"Max Drawdown:      ${self.max_drawdown:,.2f} ({drawdown_percent:.2f}% of peak capital)\n"
+                   f"Longest Win Streak:  {self.max_consecutive_wins} rounds\nLongest Loss Streak: {self.max_consecutive_losses} rounds\n\n"
+                   "The full trade-by-trade log is attached.")
+        return summary
+
+# ==============================================================================
+# 5. MAIN EXECUTION
+# ==============================================================================
+def main():
+    csv_logger = CSVLogger(CSV_LOG_FILE)
+    activity_logger = TextLogger(ACTIVITY_LOG_FILE)
+    bot = ApexTraderBot(API_KEY, APEX_STRATEGY, csv_logger, activity_logger)
+    try:
+        bot.run_main_loop() # Start the bot's own internal loop
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down bot manually...")
+    finally:
+        bot.stop()
+
+    if bot.trade_round_counter >= TARGET_TRADE_ROUNDS:
+        print("\n" + "="*50 + "\n" + "FINAL PERFORMANCE SUMMARY".center(50) + "\n" + "="*50)
+        summary_text = bot.get_performance_summary()
+        print(summary_text)
+        email_sender = EmailSender(EMAIL_CONFIG)
+        email_sender.send_report(CSV_LOG_FILE, summary_text)
+    else:
+        print("\nℹ️ Trading campaign did not complete. Email will not be sent.")
+        
+    print("\n[Program finished]")
+
+if __name__ == "__main__":
+    print("="*50 + "\n" + "APEX TRADING BOT WITH DUAL LOGGING".center(50) + "\n" + "="*50)
+    main()
