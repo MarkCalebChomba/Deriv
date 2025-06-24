@@ -19,21 +19,26 @@ except ImportError:
 # ==============================================================================
 TICK_DATA_FILE = 'live_market_data.csv'
 DATA_DOWNSAMPLE_FACTOR = 10
+
+# --- UPDATED: Focus on the $1000 capital scenario ---
+INITIAL_CAPITAL_AMOUNTS = [1000.0]
+
+# --- Golden strategies to analyze with the new stake logic ---
 STRATEGIES_TO_TEST = [
     {
-        'id': 'HEDGE_1:6_5t_20-40', 'duration': 5, 'stake_ratio': (1, 6),
+        'id': 'HEDGE_5t_1-6_Ratio_20-40_Barriers', 'duration': 5, 'stake_ratio': (1, 6),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_1:5_5t_20-40', 'duration': 5, 'stake_ratio': (1, 5),
+        'id': 'HEDGE_5t_1-5_Ratio_20-40_Barriers', 'duration': 5, 'stake_ratio': (1, 5),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_1:6_10t_20-40', 'duration': 10, 'stake_ratio': (1, 6),
+        'id': 'HEDGE_10t_1-6_Ratio_20-40_Barriers', 'duration': 10, 'stake_ratio': (1, 6),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     }
 ]
-INITIAL_CAPITAL_AMOUNTS = [10.0, 100.0, 1000.0]
+
 TOP_N_RESULTS_TO_SHOW = 25
 
 # ==============================================================================
@@ -111,12 +116,26 @@ class CSVSummaryLogger:
             writer.writerow(summary_data)
 
 def find_closest_payout(barrier, contract_type, payout_df):
-    type_df = payout_df[payout_df['contract_type'] == contract_type]
-    if type_df.empty: return 1.0, 100.0
-    type_df = type_df.copy()
-    type_df['diff'] = (pd.to_numeric(type_df['barrier']) - abs(barrier)).abs()
-    closest = type_df.loc[type_df['diff'].idxmin()]
-    return closest['payout'], closest['stake']
+    """--- NEW ROBUST VERSION ---
+    Finds the closest barrier for a specific contract type and returns its payout.
+    This version is more defensive against data type errors.
+    """
+    try:
+        numeric_barrier = float(barrier)
+    except (ValueError, TypeError):
+        return 1.0 # Default payout if barrier is not a valid number
+
+    type_df = payout_df[payout_df['contract_type'] == contract_type].copy()
+    if type_df.empty: return 1.0
+
+    # Ensure the DataFrame column is numeric, coercing errors
+    type_df['barrier'] = pd.to_numeric(type_df['barrier'], errors='coerce')
+    type_df.dropna(subset=['barrier'], inplace=True)
+    if type_df.empty: return 1.0
+
+    type_df['diff'] = (type_df['barrier'] - abs(numeric_barrier)).abs()
+    closest_row = type_df.loc[type_df['diff'].idxmin()]
+    return closest_row['payout']
 
 def plot_equity_curve(balance_history, strat_id, initial_capital, output_dir='plots'):
     if not os.path.exists(output_dir): os.makedirs(output_dir)
@@ -148,7 +167,6 @@ class BacktestRunner:
         for index in range(0, len(self.prices) - strat['duration'], DATA_DOWNSAMPLE_FACTOR):
             entry_price = self.prices[index]
             future_ticks = self.prices[index + 1 : index + 1 + strat['duration']]
-            
             trades = [
                 {'type': 'ONETOUCH', 'barrier_val': strat['p_ot_b'], 'stake_ratio': strat['stake_ratio'][0]},
                 {'type': 'NOTOUCH',  'barrier_val': strat['p_nt_b'], 'stake_ratio': strat['stake_ratio'][1]},
@@ -157,27 +175,26 @@ class BacktestRunner:
             ]
             round_net_profit = 0
             for trade in trades:
-                payout_rate, base_stake = find_closest_payout(trade['barrier_val'], trade['type'], self.payouts)
-                actual_stake = (self.initial_capital / 100) * trade['stake_ratio']
-                absolute_barrier = entry_price + trade['barrier_val']
+                payout_rate = find_closest_payout(trade['barrier_val'], trade['type'], self.payouts)
                 
-                # --- BUG FIX APPLIED HERE ---
-                # Replaced the ambiguous 'any(generator)' with a clear, vectorized numpy operation.
-                # This is both the correct fix and a performance improvement.
+                # --- NEW: Stake is now a fixed dollar amount based on the ratio ---
+                actual_stake = float(trade['stake_ratio'])
+                
+                absolute_barrier = entry_price + trade['barrier_val']
                 is_win = False
                 if trade['type'] == 'ONETOUCH':
-                    if trade['barrier_val'] > 0:
-                        is_win = (future_ticks >= absolute_barrier).any()
-                    else: # Negative barrier
-                        is_win = (future_ticks <= absolute_barrier).any()
+                    is_win = (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else (future_ticks <= absolute_barrier).any()
                 elif trade['type'] == 'NOTOUCH':
-                    if trade['barrier_val'] > 0:
-                        is_win = not (future_ticks >= absolute_barrier).any()
-                    else: # Negative barrier
-                        is_win = not (future_ticks <= absolute_barrier).any()
+                    is_win = not (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else not (future_ticks <= absolute_barrier).any()
 
-                if is_win: round_net_profit += (payout_rate * actual_stake) - actual_stake
-                else: round_net_profit -= actual_stake
+                if is_win:
+                    # Note: Payout rate from the table is the total return, so profit is (return - stake)
+                    # Assuming the provided payout is the final return on a $100 stake. We scale it.
+                    profit_per_100_stake = (payout_rate * 100) - 100
+                    profit_for_actual_stake = (profit_per_100_stake / 100) * actual_stake
+                    round_net_profit += profit_for_actual_stake
+                else:
+                    round_net_profit -= actual_stake
             
             self._update_metrics(round_net_profit)
         return self.get_results()
@@ -209,7 +226,8 @@ def main():
         price_data = df_ticks['price'].to_numpy()
         payout_data_io = io.StringIO(PAYOUT_DATA_STRING)
         df_payout = pd.read_csv(payout_data_io)
-        df_payout = df_payout[['barrier', 'payout', 'stake', 'contract_type']].dropna()
+        # We no longer need the 'stake' column from the payout file, as we define it directly
+        df_payout = df_payout[['barrier', 'payout', 'contract_type']].dropna()
         df_payout['barrier'] = pd.to_numeric(df_payout['barrier'])
     except FileNotFoundError as e: print(f"❌ Error: Could not find data file: {e.filename}"); return
     except Exception as e: print(f"❌ Error loading data: {e}"); return
