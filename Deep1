@@ -4,6 +4,7 @@ import time
 import numpy as np
 import io
 import os
+import csv
 
 # This script requires the matplotlib library for plotting.
 # Please install it first by running: pip install matplotlib
