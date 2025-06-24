@@ -12,7 +12,7 @@ receiver_email = "achiverscollege6@gmail.com" # Can be the same or different
 email_password = "leug erco myri ncxv" 
 
 # --- File to Attach ---
-file_to_attach = "backtest_summary.csv"
+file_to_attach = "plots"
 
 # --- Check if the file exists ---
 if not os.path.exists(file_to_attach):
