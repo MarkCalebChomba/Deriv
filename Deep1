@@ -1,8 +1,8 @@
 import pandas as pd
-import numpy as np
 import itertools
 import time
-import csv
+import numpy as np
+import io
 import os
 
 # This script requires the matplotlib library for plotting.
@@ -17,63 +17,85 @@ except ImportError:
 # ==============================================================================
 # 1. BACKTESTING CONFIGURATION
 # ==============================================================================
-# --- Input File ---
 TICK_DATA_FILE = 'live_market_data.csv'
-
-# --- The "Golden" Strategies to Analyze ---
-# Based on our previous results, we focus on the most profitable patterns.
+DATA_DOWNSAMPLE_FACTOR = 10
 STRATEGIES_TO_TEST = [
     {
-        'id': 'HEDGE_1:6_5t_20-40',
-        'duration': 5, 'stake_ratio': (1, 6),
-        'p_ot_b': 20.0, 'p_nt_b': 40.0,
-        'n_ot_b': 20.0, 'n_nt_b': 40.0
+        'id': 'HEDGE_1:6_5t_20-40', 'duration': 5, 'stake_ratio': (1, 6),
+        'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_1:5_5t_20-40',
-        'duration': 5, 'stake_ratio': (1, 5),
-        'p_ot_b': 20.0, 'p_nt_b': 40.0,
-        'n_ot_b': 20.0, 'n_nt_b': 40.0
+        'id': 'HEDGE_1:5_5t_20-40', 'duration': 5, 'stake_ratio': (1, 5),
+        'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_1:6_10t_20-40',
-        'duration': 10, 'stake_ratio': (1, 6),
-        'p_ot_b': 20.0, 'p_nt_b': 40.0,
-        'n_ot_b': 20.0, 'n_nt_b': 40.0
+        'id': 'HEDGE_1:6_10t_20-40', 'duration': 10, 'stake_ratio': (1, 6),
+        'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     }
 ]
-
-# --- Capital Scenarios to Simulate ---
 INITIAL_CAPITAL_AMOUNTS = [10.0, 100.0, 1000.0]
-
-# --- Data Sampling ---
-# Use a smaller factor for more precision, a larger factor for faster tests.
-DATA_DOWNSAMPLE_FACTOR = 10 
+TOP_N_RESULTS_TO_SHOW = 25
 
 # ==============================================================================
 # 2. EMBEDDED PAYOUT DATA
 # ==============================================================================
 PAYOUT_DATA_STRING = """barrier,payout,stake,contract_type
 10,1.47,100,ONETOUCH
-... (and the rest of your full payout data) ...
+12,1.54,100,ONETOUCH
+14,1.615,100,ONETOUCH
+16,1.695,100,ONETOUCH
+18,1.781,100,ONETOUCH
+20,1.8768,100,ONETOUCH
+22,1.9745,100,ONETOUCH
+24,2.0825,100,ONETOUCH
+26,2.1988,100,ONETOUCH
+28,2.3225,100,ONETOUCH
+30,2.4557,100,ONETOUCH
+32,2.6008,100,ONETOUCH
+34,2.7562,100,ONETOUCH
+36,2.922,100,ONETOUCH
+38,3.1007,100,ONETOUCH
+40,3.2976,100,ONETOUCH
+42,3.5096,100,ONETOUCH
+44,3.7156,100,ONETOUCH
+46,3.9464,100,ONETOUCH
+48,4.2153,100,ONETOUCH
+50,4.4718,100,ONETOUCH
+52,4.7975,100,ONETOUCH
+54,5.0867,100,ONETOUCH
 56,5.4132,100,ONETOUCH
 10,2.38,100,NOTOUCH
-... (and the rest of your full payout data) ...
+12,2.219,100,NOTOUCH
+14,2.08,100,NOTOUCH
+16,1.96,100,NOTOUCH
+18,1.877,100,NOTOUCH
+20,1.7632,100,NOTOUCH
+22,1.6844,100,NOTOUCH
+24,1.6133,100,NOTOUCH
+26,1.5496,100,NOTOUCH
+28,1.4939,100,NOTOUCH
+30,1.4434,100,NOTOUCH
+32,1.3975,100,NOTOUCH
+34,1.3562,100,NOTOUCH
+36,1.3196,100,NOTOUCH
+38,1.2862,100,NOTOUCH
+40,1.2554,100,NOTOUCH
+42,1.2285,100,NOTOUCH
+44,1.2038,100,NOTOUCH
+46,1.1808,100,NOTOUCH
+48,1.159,100,NOTOUCH
+50,1.14,100,NOTOUCH
+52,1.12,100,NOTOUCH
+54,1.10,100,NOTOUCH
 56,1.09,100,NOTOUCH
 """
-# Note: I've truncated the string for brevity here, but it's complete in the executable code block.
-
 # ==============================================================================
 # 3. HELPER & REPORTING CLASSES/FUNCTIONS
 # ==============================================================================
 class CSVSummaryLogger:
     def __init__(self, filename='backtest_summary.csv'):
         self.filename = filename
-        self.fieldnames = [
-            'strategy_id', 'initial_capital', 'final_balance', 'total_profit_usd', 'total_profit_percent',
-            'max_drawdown_usd', 'max_drawdown_percent', 'max_consecutive_wins', 'max_consecutive_losses',
-            'total_rounds', 'plot_filename'
-        ]
+        self.fieldnames = ['strategy_id', 'initial_capital', 'final_balance', 'total_profit_usd', 'total_profit_percent', 'max_drawdown_usd', 'max_drawdown_percent', 'max_consecutive_wins', 'max_consecutive_losses', 'total_rounds', 'plot_filename']
         self._initialize_file()
 
     def _initialize_file(self):
@@ -89,27 +111,30 @@ class CSVSummaryLogger:
             writer.writerow(summary_data)
 
 def find_closest_payout(barrier, contract_type, payout_df):
+    """Finds the closest barrier for a specific contract type and returns its payout and stake."""
     type_df = payout_df[payout_df['contract_type'] == contract_type]
     if type_df.empty: return 1.0, 100.0
     type_df = type_df.copy()
-    type_df['diff'] = (type_df['barrier'] - abs(barrier)).abs()
+
+    # --- BUG FIX APPLIED HERE ---
+    # Explicitly convert the column to numeric type before calculation to prevent errors.
+    type_df['diff'] = (pd.to_numeric(type_df['barrier']) - abs(barrier)).abs()
+    
     closest = type_df.loc[type_df['diff'].idxmin()]
     return closest['payout'], closest['stake']
 
 def plot_equity_curve(balance_history, strat_id, initial_capital, output_dir='plots'):
     """Generates and saves a PNG chart of the account balance over time."""
     if not os.path.exists(output_dir): os.makedirs(output_dir)
-    
     plt.figure(figsize=(12, 7))
     plt.plot(balance_history)
     plt.title(f"Equity Curve for {strat_id}\nInitial Capital: ${initial_capital:.2f}")
     plt.xlabel("Number of Trade Rounds")
     plt.ylabel("Account Balance ($)")
     plt.grid(True)
-    
     filename = f"{output_dir}/equity_{strat_id}_capital_{int(initial_capital)}.png"
     plt.savefig(filename)
-    plt.close() # Close the plot to free up memory
+    plt.close()
     return filename
 
 # ==============================================================================
@@ -117,101 +142,54 @@ def plot_equity_curve(balance_history, strat_id, initial_capital, output_dir='pl
 # ==============================================================================
 class BacktestRunner:
     def __init__(self, strategy, historical_data, payout_data, initial_capital):
-        self.strategy = strategy
-        self.prices = historical_data
-        self.payouts = payout_data
-        
-        # Core metrics
-        self.initial_capital = initial_capital
-        self.current_balance = initial_capital
-        self.balance_history = [initial_capital]
-        
-        # Risk metrics
-        self.peak_balance = initial_capital
-        self.max_drawdown = 0
-        self.consecutive_wins = 0
-        self.max_consecutive_wins = 0
-        self.consecutive_losses = 0
-        self.max_consecutive_losses = 0
+        self.strategy = strategy; self.prices = historical_data
+        self.payouts = payout_data; self.initial_capital = initial_capital
+        self.current_balance = initial_capital; self.balance_history = [initial_capital]
+        self.peak_balance = initial_capital; self.max_drawdown = 0
+        self.consecutive_wins = 0; self.max_consecutive_wins = 0
+        self.consecutive_losses = 0; self.max_consecutive_losses = 0
 
     def run(self):
-        """Runs the full simulation for the given strategy."""
         strat = self.strategy
-        
         for index in range(0, len(self.prices) - strat['duration'], DATA_DOWNSAMPLE_FACTOR):
             entry_price = self.prices[index]
             future_ticks = self.prices[index + 1 : index + 1 + strat['duration']]
-            
-            # --- Simulate the 4-way trade ---
             trades = [
                 {'type': 'ONETOUCH', 'barrier_val': strat['p_ot_b'], 'stake_ratio': strat['stake_ratio'][0]},
                 {'type': 'NOTOUCH',  'barrier_val': strat['p_nt_b'], 'stake_ratio': strat['stake_ratio'][1]},
                 {'type': 'ONETOUCH', 'barrier_val': -strat['n_ot_b'], 'stake_ratio': strat['stake_ratio'][0]},
                 {'type': 'NOTOUCH',  'barrier_val': -strat['n_nt_b'], 'stake_ratio': strat['stake_ratio'][1]},
             ]
-            
             round_net_profit = 0
             for trade in trades:
                 payout_rate, base_stake = find_closest_payout(trade['barrier_val'], trade['type'], self.payouts)
-                actual_stake = (self.initial_capital / 100) * trade['stake_ratio'] # Stake as % of initial capital
-                
+                actual_stake = (self.initial_capital / 100) * trade['stake_ratio']
                 absolute_barrier = entry_price + trade['barrier_val']
                 is_win = False
                 if trade['type'] == 'ONETOUCH': is_win = any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else any(tick <= absolute_barrier for tick in future_ticks)
                 elif trade['type'] == 'NOTOUCH': is_win = not any(tick >= absolute_barrier for tick in future_ticks) if trade['barrier_val'] > 0 else not any(tick <= absolute_barrier for tick in future_ticks)
-
                 if is_win: round_net_profit += (payout_rate * actual_stake) - actual_stake
                 else: round_net_profit -= actual_stake
-
             self._update_metrics(round_net_profit)
-
         return self.get_results()
 
     def _update_metrics(self, round_pnl):
-        """Updates all performance and risk metrics after each trade round."""
-        self.current_balance += round_pnl
-        self.balance_history.append(self.current_balance)
-        
-        # Update peak balance
-        if self.current_balance > self.peak_balance:
-            self.peak_balance = self.current_balance
-            
-        # Calculate and update drawdown
+        self.current_balance += round_pnl; self.balance_history.append(self.current_balance)
+        if self.current_balance > self.peak_balance: self.peak_balance = self.current_balance
         drawdown = self.peak_balance - self.current_balance
-        if drawdown > self.max_drawdown:
-            self.max_drawdown = drawdown
-
-        # Update win/loss streaks
+        if drawdown > self.max_drawdown: self.max_drawdown = drawdown
         if round_pnl > 0:
-            self.consecutive_wins += 1
-            self.consecutive_losses = 0
-            if self.consecutive_wins > self.max_consecutive_wins:
-                self.max_consecutive_wins = self.consecutive_wins
+            self.consecutive_wins += 1; self.consecutive_losses = 0
+            if self.consecutive_wins > self.max_consecutive_wins: self.max_consecutive_wins = self.consecutive_wins
         elif round_pnl < 0:
-            self.consecutive_losses += 1
-            self.consecutive_wins = 0
-            if self.consecutive_losses > self.max_consecutive_losses:
-                self.max_consecutive_losses = self.consecutive_losses
+            self.consecutive_losses += 1; self.consecutive_wins = 0
+            if self.consecutive_losses > self.max_consecutive_losses: self.max_consecutive_losses = self.consecutive_losses
     
     def get_results(self):
-        """Returns the final dictionary of all calculated metrics."""
         total_profit_usd = self.current_balance - self.initial_capital
         total_profit_percent = (total_profit_usd / self.initial_capital) * 100
         max_drawdown_percent = (self.max_drawdown / self.peak_balance) * 100 if self.peak_balance > 0 else 0
-        
-        return {
-            'strategy_id': self.strategy['id'],
-            'initial_capital': self.initial_capital,
-            'final_balance': self.current_balance,
-            'total_profit_usd': total_profit_usd,
-            'total_profit_percent': total_profit_percent,
-            'max_drawdown_usd': self.max_drawdown,
-            'max_drawdown_percent': max_drawdown_percent,
-            'max_consecutive_wins': self.max_consecutive_wins,
-            'max_consecutive_losses': self.max_consecutive_losses,
-            'total_rounds': len(self.balance_history) - 1,
-            'balance_history': self.balance_history
-        }
+        return {'strategy_id': self.strategy['id'], 'initial_capital': self.initial_capital, 'final_balance': self.current_balance, 'total_profit_usd': total_profit_usd, 'total_profit_percent': total_profit_percent, 'max_drawdown_usd': self.max_drawdown, 'max_drawdown_percent': max_drawdown_percent, 'max_consecutive_wins': self.max_consecutive_wins, 'max_consecutive_losses': self.max_consecutive_losses, 'total_rounds': len(self.balance_history) - 1, 'balance_history': self.balance_history}
 
 # ==============================================================================
 # 5. MAIN EXECUTION
@@ -220,7 +198,8 @@ def main():
     try:
         df_ticks = pd.read_csv(TICK_DATA_FILE, usecols=['price'])
         price_data = df_ticks['price'].to_numpy()
-        df_payout = pd.read_csv(io.StringIO(PAYOUT_DATA_STRING))
+        payout_data_io = io.StringIO(PAYOUT_DATA_STRING)
+        df_payout = pd.read_csv(payout_data_io)
         df_payout = df_payout[['barrier', 'payout', 'stake', 'contract_type']].dropna()
         df_payout['barrier'] = pd.to_numeric(df_payout['barrier'])
     except FileNotFoundError as e: print(f"❌ Error: Could not find data file: {e.filename}"); return
@@ -229,29 +208,17 @@ def main():
     logger = CSVSummaryLogger()
     start_time = time.time()
     
-    print("="*80)
-    print("ADVANCED RISK & CAPITAL ANALYSIS BACKTESTER".center(80))
-    print("="*80)
+    print("="*80 + "\n" + "ADVANCED RISK & CAPITAL ANALYSIS BACKTESTER".center(80) + "\n" + "="*80)
 
     for strat in STRATEGIES_TO_TEST:
         for capital in INITIAL_CAPITAL_AMOUNTS:
             print(f"\n🔬 Running Simulation for Strategy '{strat['id']}' with Initial Capital ${capital:.2f}...")
-            
             runner = BacktestRunner(strat, price_data, df_payout, capital)
             results = runner.run()
-            
-            # --- Generate Plot ---
             plot_filename = plot_equity_curve(results['balance_history'], strat['id'], capital)
-            
-            # --- Log to CSV ---
-            csv_log_data = {**results, 'plot_filename': plot_filename}
-            del csv_log_data['balance_history'] # Don't log the giant list to CSV
+            csv_log_data = {**results, 'plot_filename': plot_filename}; del csv_log_data['balance_history']
             logger.log_summary(csv_log_data)
-
-            # --- Print Console Report ---
-            print("\n" + "-"*50)
-            print(f"    RESULTS FOR: {strat['id']} | Start Capital: ${capital:.2f}")
-            print("-"*50)
+            print("\n" + "-"*50 + f"\n    RESULTS FOR: {strat['id']} | Start Capital: ${capital:.2f}\n" + "-"*50)
             print(f"    -> Final Balance:          ${results['final_balance']:>10.2f}")
             print(f"    -> Net Profit:             ${results['total_profit_usd']:>+10.2f} ({results['total_profit_percent']:+.2f}%)")
             print(f"    -> Max Drawdown:           ${results['max_drawdown_usd']:>10.2f} ({results['max_drawdown_percent']:.2f}%)")
@@ -263,7 +230,6 @@ def main():
     end_time = time.time()
     print(f"\n✅ All simulations complete. Total analysis time: {end_time - start_time:.2f} seconds.")
     print(f"📄 Summary of all runs saved to '{logger.filename}'.")
-
 
 if __name__ == '__main__':
     print("Starting Advanced Risk Analysis Engine...")
