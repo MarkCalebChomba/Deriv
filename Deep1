@@ -19,27 +19,22 @@ except ImportError:
 # ==============================================================================
 TICK_DATA_FILE = 'live_market_data.csv'
 DATA_DOWNSAMPLE_FACTOR = 10
-
-# --- UPDATED: Focus on the $1000 capital scenario ---
-INITIAL_CAPITAL_AMOUNTS = [1000.0]
-
-# --- Golden strategies to analyze with the new stake logic ---
 STRATEGIES_TO_TEST = [
     {
-        'id': 'HEDGE_5t_1-6_Ratio_20-40_Barriers', 'duration': 5, 'stake_ratio': (1, 6),
+        'id': 'HEDGE_5t_1-6_Ratio_20-40', 'duration': 5, 'stake_ratio': (1, 6),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_5t_1-5_Ratio_20-40_Barriers', 'duration': 5, 'stake_ratio': (1, 5),
+        'id': 'HEDGE_5t_1-5_Ratio_20-40', 'duration': 5, 'stake_ratio': (1, 5),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     },
     {
-        'id': 'HEDGE_10t_1-6_Ratio_20-40_Barriers', 'duration': 10, 'stake_ratio': (1, 6),
+        'id': 'HEDGE_10t_1-6_Ratio_20-40', 'duration': 10, 'stake_ratio': (1, 6),
         'p_ot_b': 20.0, 'p_nt_b': 40.0, 'n_ot_b': 20.0, 'n_nt_b': 40.0
     }
 ]
-
-TOP_N_RESULTS_TO_SHOW = 25
+INITIAL_CAPITAL_AMOUNTS = [1000.0]
+TOP_N_RESULTS_TO_SHOW = 30
 
 # ==============================================================================
 # 2. EMBEDDED PAYOUT DATA
@@ -116,24 +111,12 @@ class CSVSummaryLogger:
             writer.writerow(summary_data)
 
 def find_closest_payout(barrier, contract_type, payout_df):
-    """--- NEW ROBUST VERSION ---
-    Finds the closest barrier for a specific contract type and returns its payout.
-    This version is more defensive against data type errors.
-    """
-    try:
-        numeric_barrier = float(barrier)
-    except (ValueError, TypeError):
-        return 1.0 # Default payout if barrier is not a valid number
-
     type_df = payout_df[payout_df['contract_type'] == contract_type].copy()
     if type_df.empty: return 1.0
-
-    # Ensure the DataFrame column is numeric, coercing errors
     type_df['barrier'] = pd.to_numeric(type_df['barrier'], errors='coerce')
     type_df.dropna(subset=['barrier'], inplace=True)
     if type_df.empty: return 1.0
-
-    type_df['diff'] = (type_df['barrier'] - abs(numeric_barrier)).abs()
+    type_df['diff'] = (type_df['barrier'] - abs(barrier)).abs()
     closest_row = type_df.loc[type_df['diff'].idxmin()]
     return closest_row['payout']
 
@@ -176,26 +159,16 @@ class BacktestRunner:
             round_net_profit = 0
             for trade in trades:
                 payout_rate = find_closest_payout(trade['barrier_val'], trade['type'], self.payouts)
-                
-                # --- NEW: Stake is now a fixed dollar amount based on the ratio ---
                 actual_stake = float(trade['stake_ratio'])
-                
                 absolute_barrier = entry_price + trade['barrier_val']
                 is_win = False
-                if trade['type'] == 'ONETOUCH':
-                    is_win = (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else (future_ticks <= absolute_barrier).any()
-                elif trade['type'] == 'NOTOUCH':
-                    is_win = not (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else not (future_ticks <= absolute_barrier).any()
-
+                if trade['type'] == 'ONETOUCH': is_win = (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else (future_ticks <= absolute_barrier).any()
+                elif trade['type'] == 'NOTOUCH': is_win = not (future_ticks >= absolute_barrier).any() if trade['barrier_val'] > 0 else not (future_ticks <= absolute_barrier).any()
                 if is_win:
-                    # Note: Payout rate from the table is the total return, so profit is (return - stake)
-                    # Assuming the provided payout is the final return on a $100 stake. We scale it.
-                    profit_per_100_stake = (payout_rate * 100) - 100
-                    profit_for_actual_stake = (profit_per_100_stake / 100) * actual_stake
-                    round_net_profit += profit_for_actual_stake
+                    profit_per_1_stake = payout_rate - 1
+                    round_net_profit += profit_per_1_stake * actual_stake
                 else:
                     round_net_profit -= actual_stake
-            
             self._update_metrics(round_net_profit)
         return self.get_results()
 
@@ -218,16 +191,44 @@ class BacktestRunner:
         return {'strategy_id': self.strategy['id'], 'initial_capital': self.initial_capital, 'final_balance': self.current_balance, 'total_profit_usd': total_profit_usd, 'total_profit_percent': total_profit_percent, 'max_drawdown_usd': self.max_drawdown, 'max_drawdown_percent': max_drawdown_percent, 'max_consecutive_wins': self.max_consecutive_wins, 'max_consecutive_losses': self.max_consecutive_losses, 'total_rounds': len(self.balance_history) - 1, 'balance_history': self.balance_history}
 
 # ==============================================================================
-# 5. MAIN EXECUTION
+# 5. MAIN EXECUTION & REPORTING
 # ==============================================================================
+def print_csv_report(results):
+    if not results: print("No results to report."); return
+    for res in results:
+        res['avg_profit_per_round'] = res['total_profit'] / res['trade_rounds'] if res['trade_rounds'] > 0 else 0
+    sorted_results = sorted(results, key=lambda x: x['total_profit'], reverse=True)
+    
+    print("\n\n" + "="*80 + "\n" + "BACKTESTING REPORT - TOP 30 STRATEGIES (CSV FORMAT)".center(80) + "\n" + "="*80)
+    print("You can copy the text below and paste it directly into a text file or spreadsheet.\n")
+
+    header = "strategy_id,duration,stake_ratio_ot,stake_ratio_nt,b_pos_ot,b_pos_nt,b_neg_ot,b_neg_nt,total_profit,avg_profit_per_round"
+    print(header)
+    
+    for res in sorted_results[:TOP_N_RESULTS_TO_SHOW]:
+        s = res['strategy']
+        # --- BUG FIX APPLIED HERE ---
+        # Correctly access the elements of the 'stake_ratio' tuple.
+        row = [
+            s['id'],
+            s['duration'],
+            s['stake_ratio'][0], # First element of the tuple, e.g., 1
+            s['stake_ratio'][1], # Second element of the tuple, e.g., 6
+            s['p_ot_b'], s['p_nt_b'],
+            s['n_ot_b'], s['n_nt_b'],
+            f"{res['total_profit']:.2f}",
+            f"{res['avg_profit_per_round']:.4f}"
+        ]
+        print(','.join(map(str, row)))
+    print("\n" + "="*80)
+
 def main():
     try:
         df_ticks = pd.read_csv(TICK_DATA_FILE, usecols=['price'])
         price_data = df_ticks['price'].to_numpy()
         payout_data_io = io.StringIO(PAYOUT_DATA_STRING)
         df_payout = pd.read_csv(payout_data_io)
-        # We no longer need the 'stake' column from the payout file, as we define it directly
-        df_payout = df_payout[['barrier', 'payout', 'contract_type']].dropna()
+        df_payout = df_payout[['barrier', 'payout', 'stake', 'contract_type']].dropna()
         df_payout['barrier'] = pd.to_numeric(df_payout['barrier'])
     except FileNotFoundError as e: print(f"❌ Error: Could not find data file: {e.filename}"); return
     except Exception as e: print(f"❌ Error loading data: {e}"); return
@@ -237,11 +238,15 @@ def main():
     
     print("="*80 + "\n" + "ADVANCED RISK & CAPITAL ANALYSIS BACKTESTER".center(80) + "\n" + "="*80)
 
+    all_results = []
     for strat in STRATEGIES_TO_TEST:
         for capital in INITIAL_CAPITAL_AMOUNTS:
             print(f"\n🔬 Running Simulation for Strategy '{strat['id']}' with Initial Capital ${capital:.2f}...")
             runner = BacktestRunner(strat, price_data, df_payout, capital)
             results = runner.run()
+            all_results.append(results) # Collect results for final report
+            
+            # Print individual console report
             plot_filename = plot_equity_curve(results['balance_history'], strat['id'], capital)
             csv_log_data = {**results, 'plot_filename': plot_filename}; del csv_log_data['balance_history']
             logger.log_summary(csv_log_data)
@@ -253,6 +258,9 @@ def main():
             print(f"    -> Longest Loss Streak:    {results['max_consecutive_losses']} rounds")
             print(f"    -> Equity Curve Plot:      '{plot_filename}'")
             print("-"*50)
+    
+    # Print the final summary CSV report for all tests
+    print_csv_report(all_results)
     
     end_time = time.time()
     print(f"\n✅ All simulations complete. Total analysis time: {end_time - start_time:.2f} seconds.")
